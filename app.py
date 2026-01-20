@@ -7,228 +7,196 @@ from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime
 
-# --- 頁面設定 (開啟寬螢幕模式) ---
-st.set_page_config(page_title="BTC Pro Trading Tool", layout="wide")
+# --- 1. 頁面設定 ---
+st.set_page_config(page_title="BTC VP Trading Bot", layout="wide")
 
-# --- CSS 優化 (讓圖表佔滿寬度) ---
+# CSS 優化：減少頂部留白
 st.markdown("""
 <style>
-    .block-container {padding-top: 1rem; padding-bottom: 0rem; padding-left: 1rem; padding-right: 1rem;}
+    .block-container {padding-top: 1rem; padding-bottom: 0rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 側邊欄設定 ---
+# --- 2. 側邊欄設定 ---
 with st.sidebar:
     st.title("⚙️ 參數設定")
-    symbol = st.text_input("交易對 (Binance)", "BTC/USDT")
-    timeframe = st.selectbox("時間週期", ["15m", "1h", "4h", "1d"], index=1)
-    limit = st.slider("K線數量 (影響計算範圍)", 100, 1000, 500)
+    # 改用 Kraken 的交易對格式
+    symbol = st.text_input("交易對 (Kraken)", "BTC/USD") 
+    timeframe = st.selectbox("時間週期", ["15m", "30m", "1h", "4h", "1d"], index=2)
+    # 預設降低一點以加速啟動
+    limit = st.slider("K線數量", 100, 1000, 300) 
     
     st.markdown("---")
     st.markdown("### 策略參數")
     va_percent = st.slider("Value Area %", 0.1, 0.9, 0.7)
-    risk_reward = st.number_input("盈虧比 (Risk:Reward)", value=2.0, step=0.1)
+    risk_reward = st.number_input("盈虧比 (R:R)", value=2.0, step=0.1)
     
-    if st.button("🔄 刷新數據", type="primary"):
+    refresh = st.button("🔄 刷新數據", type="primary")
+    if refresh:
         st.cache_data.clear()
 
-# --- 核心函數：從 Binance 獲取數據 (使用 CCXT，速度快且穩定) ---
-@st.cache_data(ttl=15)  # 15秒緩存，避免過度請求
-def fetch_binance_data(symbol, timeframe, limit):
+# --- 3. 核心函數：獲取數據 (改用 Kraken) ---
+@st.cache_data(ttl=30)
+def fetch_data(symbol, timeframe, limit):
+    # 使用 st.status 顯示進度，避免使用者以為卡死
     try:
-        exchange = ccxt.binance()
-        # 獲取 OHLCV
+        # 改用 Kraken，因為 Binance 會擋雲端伺服器 IP
+        exchange = ccxt.kraken() 
+        
+        # 抓取數據
         bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        
+        # 整理數據
         df = pd.DataFrame(bars, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df
     except Exception as e:
-        st.error(f"數據獲取失敗 (請檢查交易對名稱): {e}")
-        return pd.DataFrame()
+        return None
 
-# --- 核心函數：計算 Volume Profile (使用 Numpy 加速) ---
-def calculate_vp_numpy(df, va_pct=0.7, n_bins=100):
-    # 定義價格區間
-    price_min = df['Low'].min()
-    price_max = df['High'].max()
-    
-    # 建立價格區間 (Bins)
-    bins = np.linspace(price_min, price_max, n_bins)
-    
-    # 計算每個區間的成交量 (這裡簡化使用 Close 對應的 Volume)
-    # 專業版可用 Tick 數據，但在 K 線層級此方法足夠
-    hist, bin_edges = np.histogram(df['Close'], bins=bins, weights=df['Volume'])
-    
-    # 建立 DataFrame
-    vp_df = pd.DataFrame({'Volume': hist, 'Price': bin_edges[:-1]})
-    
-    # 1. 找出 POC (最大量價格)
-    max_vol_idx = vp_df['Volume'].idxmax()
-    poc_price = vp_df.loc[max_vol_idx, 'Price']
-    
-    # 2. 計算 Value Area (VA)
-    total_vol = vp_df['Volume'].sum()
-    target_vol = total_vol * va_pct
-    
-    # 從 POC 向外擴散累加成交量
-    current_vol = vp_df.loc[max_vol_idx, 'Volume']
-    up_idx = max_vol_idx
-    down_idx = max_vol_idx
-    
-    while current_vol < target_vol:
-        up_vol = vp_df.loc[up_idx + 1, 'Volume'] if up_idx + 1 < len(vp_df) else 0
-        down_vol = vp_df.loc[down_idx - 1, 'Volume'] if down_idx - 1 >= 0 else 0
+# --- 4. 核心函數：計算 Volume Profile ---
+def calculate_vp(df, va_pct=0.7, n_bins=100):
+    try:
+        price_min = df['Low'].min()
+        price_max = df['High'].max()
         
-        if up_vol > down_vol:
-            current_vol += up_vol
-            up_idx += 1
-        else:
-            current_vol += down_vol
-            down_idx -= 1
-            
-        if up_idx >= len(vp_df) -1 and down_idx <= 0:
-            break
-            
-    vah = vp_df.loc[up_idx, 'Price']
-    val = vp_df.loc[down_idx, 'Price']
-    
-    return vp_df, poc_price, vah, val
-
-# --- 主程式 ---
-df = fetch_binance_data(symbol, timeframe, limit)
-
-if not df.empty:
-    # 計算 VP
-    vp_df, poc, vah, val = calculate_vp_numpy(df, va_percent)
-    
-    # 最新數據
-    last_close = df['Close'].iloc[-1]
-    last_low = df['Low'].iloc[-1]
-    last_high = df['High'].iloc[-1]
-    
-    # --- 交易訊號判斷 ---
-    signal_txt = "無訊號"
-    signal_color = "grey"
-    sl_price = 0.0
-    tp_price = 0.0
-    
-    # 判斷邏輯：價格曾在 VAL 之下，但收盤收回 VAL 之上 (假跌破)
-    if df['Low'].iloc[-1] < val and df['Close'].iloc[-1] > val:
-        signal_txt = "LONG (做多)"
-        signal_color = "#00FF00" # 亮綠
-        sl_price = df['Low'].iloc[-1]  # 止損設在當前K線最低點
-        risk = last_close - sl_price
-        tp_price = last_close + (risk * risk_reward)
+        # 建立價格區間
+        bins = np.linspace(price_min, price_max, n_bins)
         
-    # 判斷邏輯：價格曾在 VAH 之上，但收盤跌回 VAH 之下 (假突破)
-    elif df['High'].iloc[-1] > vah and df['Close'].iloc[-1] < vah:
-        signal_txt = "SHORT (做空)"
-        signal_color = "#FF0000" # 亮紅
-        sl_price = df['High'].iloc[-1] # 止損設在當前K線最高點
-        risk = sl_price - last_close
-        tp_price = last_close - (risk * risk_reward)
+        # 計算分佈 (Numpy 加速)
+        hist, bin_edges = np.histogram(df['Close'], bins=bins, weights=df['Volume'])
+        vp_df = pd.DataFrame({'Volume': hist, 'Price': bin_edges[:-1]})
+        
+        # 找 POC
+        max_idx = vp_df['Volume'].idxmax()
+        poc = vp_df.loc[max_idx, 'Price']
+        
+        # 找 VA (Value Area)
+        total_vol = vp_df['Volume'].sum()
+        target_vol = total_vol * va_pct
+        
+        current_vol = vp_df.loc[max_idx, 'Volume']
+        up = max_idx
+        down = max_idx
+        
+        while current_vol < target_vol:
+            v_up = vp_df.loc[up+1, 'Volume'] if up+1 < len(vp_df) else 0
+            v_down = vp_df.loc[down-1, 'Volume'] if down-1 >= 0 else 0
+            
+            if v_up > v_down:
+                current_vol += v_up
+                up += 1
+            else:
+                current_vol += v_down
+                down -= 1
+            
+            if up >= len(vp_df)-1 and down <= 0:
+                break
+                
+        return vp_df, poc, vp_df.loc[up, 'Price'], vp_df.loc[down, 'Price']
+    except Exception:
+        return pd.DataFrame(), 0, 0, 0
 
-    # --- 介面佈局 ---
+# --- 5. 主程式邏輯 ---
+with st.status("正在連線交易所...", expanded=True) as status:
+    st.write("正在從 Kraken 下載數據...")
+    df = fetch_data(symbol, timeframe, limit)
     
-    # 頂部資訊欄
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("當前價格", f"{last_close:.2f}")
-    c2.metric("VAH (壓力)", f"{vah:.2f}", delta_color="inverse")
-    c3.metric("VAL (支撐)", f"{val:.2f}", delta_color="normal")
-    c4.metric("POC (核心)", f"{poc:.2f}")
-    
-    if signal_txt != "無訊號":
-        c5.markdown(f"### <span style='color:{signal_color}'>{signal_txt}</span>", unsafe_allow_html=True)
-        st.toast(f"觸發交易訊號: {signal_txt}!", icon="🚨")
+    if df is not None and not df.empty:
+        st.write("正在計算 Volume Profile...")
+        vp_df, poc, vah, val = calculate_vp(df, va_percent)
+        status.update(label="數據載入完成!", state="complete", expanded=False)
     else:
-        c5.write("等待訊號...")
+        status.update(label="數據下載失敗", state="error")
+        st.error("無法下載數據。可能原因：交易對名稱錯誤 (Kraken 使用 BTC/USD) 或網路連線問題。")
+        st.stop()
 
-    # --- 繪圖 (使用 Subplots 將 K線 與 Volume Profile 分開) ---
-    # 建立 1行2列 的圖表，共享Y軸 (價格軸)
-    fig = make_subplots(
-        rows=1, cols=2, 
-        shared_yaxes=True, 
-        column_widths=[0.75, 0.25], # 左邊佔75%，右邊佔25%
-        horizontal_spacing=0.02,
-        subplot_titles=(f"{symbol} K-Line Chart", "Volume Profile")
-    )
+# 最新價格數據
+last_close = df['Close'].iloc[-1]
+last_low = df['Low'].iloc[-1]
+last_high = df['High'].iloc[-1]
 
-    # 1. 左側：K線圖
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df['Open'], high=df['High'],
-        low=df['Low'], close=df['Close'],
-        name="Price"
-    ), row=1, col=1)
+# --- 6. 訊號邏輯 ---
+signal = "WAIT"
+color = "gray"
+sl = 0.0
+tp = 0.0
 
-    # 2. 左側：關鍵線位 (VAH, VAL, POC)
-    # 使用 Shape 線條延伸到全圖
-    fig.add_hline(y=vah, line_dash="dot", line_color="green", line_width=1, row=1, col=1, annotation_text="VAH")
-    fig.add_hline(y=val, line_dash="dot", line_color="green", line_width=1, row=1, col=1, annotation_text="VAL")
-    fig.add_hline(y=poc, line_color="red", line_width=2, row=1, col=1, annotation_text="POC")
+# 策略：價格跌破 VAL 收回 (做多)
+if df['Low'].iloc[-1] < val and df['Close'].iloc[-1] > val:
+    signal = "LONG"
+    color = "#00FF00"
+    sl = df['Low'].iloc[-1]
+    risk = last_close - sl
+    tp = last_close + (risk * risk_reward)
 
-    # 3. 標記止盈止損 (如果有訊號)
-    if signal_txt != "無訊號":
-        # 標記進場點
-        fig.add_trace(go.Scatter(
-            x=[df.index[-1]], y=[last_close],
-            mode='markers', marker=dict(color=signal_color, size=15, symbol='cross'),
-            name="Entry"
-        ), row=1, col=1)
-        
-        # 繪製 SL/TP 區間框
-        if signal_txt == "LONG (做多)":
-            fill_color = "rgba(0, 255, 0, 0.1)"
-            line_color = "green"
-        else:
-            fill_color = "rgba(255, 0, 0, 0.1)"
-            line_color = "red"
-            
-        # 止盈線
-        fig.add_hline(y=tp_price, line_color=line_color, line_dash="dash", annotation_text=f"TP: {tp_price:.2f}", row=1, col=1)
-        # 止損線
-        fig.add_hline(y=sl_price, line_color="white", line_dash="dash", annotation_text=f"SL: {sl_price:.2f}", row=1, col=1)
+# 策略：價格突破 VAH 跌回 (做空)
+elif df['High'].iloc[-1] > vah and df['Close'].iloc[-1] < vah:
+    signal = "SHORT"
+    color = "#FF0000"
+    sl = df['High'].iloc[-1]
+    risk = sl - last_close
+    tp = last_close - (risk * risk_reward)
 
-    # 4. 右側：Volume Profile (水平直方圖)
-    # 區分顏色：POC用紅色，VA內用藍色，VA外用灰色
-    colors = []
-    for price in vp_df['Price']:
-        if abs(price - poc) < (poc * 0.001): # 接近 POC
-            colors.append('red')
-        elif val <= price <= vah: # 在 Value Area 內
-            colors.append('rgba(0, 100, 255, 0.5)')
-        else: # 在 Value Area 外
-            colors.append('rgba(128, 128, 128, 0.2)')
+# --- 7. 畫面顯示 ---
 
-    fig.add_trace(go.Bar(
-        x=vp_df['Volume'],
-        y=vp_df['Price'],
-        orientation='h',
-        marker_color=colors,
-        name="Volume Profile",
-        showlegend=False
-    ), row=1, col=2)
-
-    # --- 圖表樣式設定 ---
-    fig.update_layout(
-        height=800, # 增加高度，解決 "圖太小" 問題
-        template="plotly_dark",
-        dragmode="pan",
-        xaxis_rangeslider_visible=False, # 隱藏下方滑桿以節省空間
-        margin=dict(l=10, r=10, t=30, b=10),
-        hovermode="y unified" # 讓滑鼠懸停時更容易對齊價格
-    )
-    
-    # 鎖定右側 Volume Profile 的顯示方式
-    fig.update_xaxes(title_text="Volume", row=1, col=2, showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor='rgba(128,128,128,0.2)')
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- 下方數據表格 ---
-    with st.expander("📊 查看詳細數據"):
-        st.dataframe(df.tail(10).sort_index(ascending=False))
-
+# 頂部指標
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("價格", f"{last_close:.0f}")
+m2.metric("VAH", f"{vah:.0f}")
+m3.metric("VAL", f"{val:.0f}")
+m4.metric("POC", f"{poc:.0f}")
+if signal != "WAIT":
+    m5.markdown(f"### <span style='color:{color}'>{signal}</span>", unsafe_allow_html=True)
 else:
-    st.warning("無法獲取數據，請檢查網路連線或稍後再試。")
+    m5.write("等待訊號...")
+
+# 繪圖 (左右分佈)
+fig = make_subplots(
+    rows=1, cols=2, 
+    shared_yaxes=True, 
+    column_widths=[0.8, 0.2], 
+    horizontal_spacing=0.01
+)
+
+# K線
+fig.add_trace(go.Candlestick(
+    x=df.index, open=df['Open'], high=df['High'],
+    low=df['Low'], close=df['Close'], name="BTC"
+), row=1, col=1)
+
+# 關鍵線位
+fig.add_hline(y=vah, line_dash="dot", line_color="green", row=1, col=1)
+fig.add_hline(y=val, line_dash="dot", line_color="green", row=1, col=1)
+fig.add_hline(y=poc, line_color="red", line_width=2, row=1, col=1)
+
+# 交易標記
+if signal != "WAIT":
+    # 進場點
+    fig.add_trace(go.Scatter(
+        x=[df.index[-1]], y=[last_close], mode='markers',
+        marker=dict(color=color, size=12, symbol='x'), name="Signal"
+    ), row=1, col=1)
+    
+    # 止盈止損線
+    fig.add_hline(y=tp, line_color=color, line_dash="dash", annotation_text="TP", row=1, col=1)
+    fig.add_hline(y=sl, line_color="white", line_dash="dash", annotation_text="SL", row=1, col=1)
+
+# Volume Profile
+colors = ['red' if abs(p - poc) < poc*0.001 else 'blue' if val <= p <= vah else 'gray' for p in vp_df['Price']]
+fig.add_trace(go.Bar(
+    x=vp_df['Volume'], y=vp_df['Price'], orientation='h',
+    marker_color=colors, showlegend=False
+), row=1, col=2)
+
+fig.update_layout(
+    height=700, 
+    template="plotly_dark", 
+    margin=dict(l=0, r=0, t=30, b=0),
+    xaxis_rangeslider_visible=False,
+    hovermode="y unified"
+)
+# 隱藏右側X軸刻度
+fig.update_xaxes(showticklabels=False, row=1, col=2)
+
+st.plotly_chart(fig, use_container_width=True)
