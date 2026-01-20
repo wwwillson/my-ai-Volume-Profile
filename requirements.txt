@@ -1,6 +1,6 @@
 streamlit
 ccxt
 pandas
-numpy
 plotly
-pandas_ta
+numpy
+streamlit-autorefresh
