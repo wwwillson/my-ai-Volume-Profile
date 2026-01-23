@@ -22,9 +22,9 @@ with st.sidebar:
     st.title("⚙️ 交易控制台")
     
     # [需求] 2分鐘自動刷新
-    if st.toggle("開啟自動刷新 (2分鐘)", value=False):
-        # interval 單位是毫秒: 2 * 60 * 1000 = 120000
-        count = st_autorefresh(interval=120000, limit=None, key="auto_refresh")
+    if st.toggle("開啟自動刷新 (1分鐘)", value=False):
+        # interval 單位是毫秒: 1 * 60 * 1000 = 120000
+        count = st_autorefresh(interval=60000, limit=None, key="auto_refresh")
         st.caption(f"監控中... (刷新次數: {count})")
 
     st.divider()
